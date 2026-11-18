@@ -1,0 +1,328 @@
+-- One app profile per Supabase Auth user.
+create table public.profiles (
+ id uuid primary key references auth.users (id) on delete cascade,
+ display_name text,
+ created_at timestamptz not null default now()
+);
+
+
+-- Each row represents one complete campus parking location.
+create table public.parking_locations (
+ parking_location_id uuid primary key default gen_random_uuid(),
+ location_name text not null,
+ latitude numeric(9, 6) not null
+   check (latitude between -90 and 90),
+ longitude numeric(10, 7) not null
+   check (longitude between -180 and 180),
+ permit_requirement text,
+ parking_cost numeric(10, 2)
+   check (parking_cost is null or parking_cost >= 0)
+);
+
+
+create table public.parking_reports (
+ parking_report_id uuid primary key default gen_random_uuid(),
+ student_id uuid not null
+   references public.profiles (id) on delete cascade,
+ parking_location_id uuid not null
+   references public.parking_locations (parking_location_id),
+ reported_condition text not null
+   check (reported_condition in ('Open', 'Nearly Full', 'Full')),
+ submitted_at timestamptz not null default now(),
+ verification_status text
+);
+
+
+create index parking_reports_location_submitted_idx
+ on public.parking_reports (parking_location_id, submitted_at desc);
+
+
+create index parking_reports_student_idx
+ on public.parking_reports (student_id);
+
+
+-- At most one stored recent route per student.
+create table public.recent_routes (
+ recent_route_id uuid primary key default gen_random_uuid(),
+ student_id uuid not null unique
+   references public.profiles (id) on delete cascade,
+ parking_location_id uuid not null
+   references public.parking_locations (parking_location_id),
+ route_started_at timestamptz not null,
+ updated_at timestamptz not null default now()
+);
+
+
+-- Keep updated_at current when a route is changed.
+create function public.set_recent_route_updated_at()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+ new.updated_at := now();
+ return new;
+end;
+$$;
+
+
+create trigger recent_routes_set_updated_at
+before update on public.recent_routes
+for each row
+execute function public.set_recent_route_updated_at();
+
+
+-- Create a profile from Auth user metadata on signup.
+create function public.handle_new_user_profile()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+ insert into public.profiles (id, display_name, created_at)
+ values (
+   new.id,
+   nullif(new.raw_user_meta_data ->> 'display_name', ''),
+   new.created_at
+ )
+ on conflict (id) do nothing;
+
+
+ return new;
+end;
+$$;
+
+
+create trigger on_auth_user_created_create_profile
+after insert on auth.users
+for each row
+execute function public.handle_new_user_profile();
+
+
+revoke all on function public.handle_new_user_profile()
+ from public, anon, authenticated;
+
+
+-- Enable row-level security.
+alter table public.profiles enable row level security;
+alter table public.parking_locations enable row level security;
+alter table public.parking_reports enable row level security;
+alter table public.recent_routes enable row level security;
+
+
+-- Parking locations can be listed without signing in.
+create policy "Parking locations are readable"
+on public.parking_locations
+for select
+to anon, authenticated
+using (true);
+
+
+-- Students can access and update only their own profile.
+create policy "Students can read their own profile"
+on public.profiles
+for select
+to authenticated
+using ((select auth.uid()) = id);
+
+
+create policy "Students can update their own profile"
+on public.profiles
+for update
+to authenticated
+using ((select auth.uid()) = id)
+with check ((select auth.uid()) = id);
+
+
+-- Signed-in students can read reports and submit reports as themselves.
+create policy "Reports are readable by authenticated students"
+on public.parking_reports
+for select
+to authenticated
+using (true);
+
+
+create policy "Students can submit their own reports"
+on public.parking_reports
+for insert
+to authenticated
+with check ((select auth.uid()) = student_id);
+
+
+-- Students can manage only their own recent route.
+create policy "Students can read their own recent route"
+on public.recent_routes
+for select
+to authenticated
+using ((select auth.uid()) = student_id);
+
+
+create policy "Students can create their own recent route"
+on public.recent_routes
+for insert
+to authenticated
+with check ((select auth.uid()) = student_id);
+
+
+create policy "Students can update their own recent route"
+on public.recent_routes
+for update
+to authenticated
+using ((select auth.uid()) = student_id)
+with check ((select auth.uid()) = student_id);
+
+
+create policy "Students can delete their own recent route"
+on public.recent_routes
+for delete
+to authenticated
+using ((select auth.uid()) = student_id);
+
+
+-- Grant the table operations used by the policies.
+grant select on public.parking_locations to anon, authenticated;
+grant select, update on public.profiles to authenticated;
+grant select, insert on public.parking_reports to authenticated;
+grant select, insert, update, delete on public.recent_routes to authenticated;
+
+
+commit;
+
+
+
+
+
+SET parking_location_id = EXCLUDED.parking_location_id,
+   route_started_at = EXCLUDED.route_started_at;
+
+
+-- READ: Recent routes
+SELECT rr.student_id, l.location_name, rr.route_started_at, rr.updated_at
+FROM public.recent_routes rr
+JOIN public.parking_locations l ON l.parking_location_id = rr.parking_location_id;
+
+
+-- UPDATE: Recent route (trigger refreshes updated_at)
+UPDATE public.recent_routes SET route_started_at = now() - interval '5 minutes'
+WHERE student_id = '63755afd-9d50-4c5f-9a84-0cf8d1d59431'
+RETURNING *;
+
+
+-- DELETE: Child records first, then parent location
+DELETE FROM public.parking_reports
+WHERE parking_report_id = 'd2222222-2222-4222-8222-222222222222'
+RETURNING *;
+
+
+DELETE FROM public.recent_routes
+WHERE student_id = '63755afd-9d50-4c5f-9a84-0cf8d1d59431'
+RETURNING *;
+
+
+DELETE FROM public.parking_locations
+WHERE parking_location_id = 'd1111111-1111-4111-8111-111111111111'
+RETURNING *;
+
+
+-- Do not DELETE a profile for an existing Auth user merely to test CRUD.
+-- Profiles are automatically created by the auth signup trigger and
+-- deleting one can break references and leave an Auth user without a profile.
+-- Example of an administrator-only profile delete, intentionally disabled:
+-- DELETE FROM public.profiles WHERE id = '<dedicated disposable auth user UUID>';
+
+
+ROLLBACK;
+
+
+BEGIN;
+
+
+-- READ: Recent routes
+SELECT rr.student_id, l.location_name, rr.route_started_at, rr.updated_at
+FROM public.recent_routes rr
+JOIN public.parking_locations l
+ ON l.parking_location_id = rr.parking_location_id;
+
+
+-- UPDATE: Recent route (trigger refreshes updated_at)
+UPDATE public.recent_routes
+SET route_started_at = now() - interval '5 minutes'
+WHERE student_id = '63755afd-9d50-4c5f-9a84-0cf8d1d59431'
+RETURNING *;
+
+
+-- DELETE: Child records first, then parent location
+DELETE FROM public.parking_reports
+WHERE parking_report_id = 'd2222222-2222-4222-8222-222222222222'
+RETURNING *;
+
+
+DELETE FROM public.recent_routes
+WHERE student_id = '63755afd-9d50-4c5f-9a84-0cf8d1d59431'
+RETURNING *;
+
+
+DELETE FROM public.parking_locations
+WHERE parking_location_id = 'd1111111-1111-4111-8111-111111111111'
+RETURNING *;
+
+
+ROLLBACK;
+
+
+-- ParkSmart sample seed data for Supabase/PostgreSQL.
+-- Prerequisite: the two UUIDs below must already exist in auth.users.
+-- Parking locations, permit rules, prices, and reports are illustrative test data.
+-- Run after applying the initial schema migration.
+
+
+begin;
+
+
+-- Profiles are normally created by the auth.users trigger.
+-- Insert missing profiles without overwriting existing user data.
+insert into public.profiles (id, display_name)
+values
+ ('66cf2911-55ae-4e82-a0b4-473ecb83aeff', 'Sample Student One'),
+ ('63755afd-9d50-4c5f-9a84-0cf8d1d59431', 'Sample Student Two')
+on conflict (id) do nothing;
+
+
+-- Fictional sample parking inventory around the Chico State area.
+-- Fixed UUIDs make this seed script safe to rerun.
+insert into public.parking_locations
+ (parking_location_id, location_name, latitude, longitude, permit_requirement, parking_cost)
+values
+ ('10000000-0000-4000-8000-000000000001', 'Demo Campus North Lot', 39.731200, -121.8501000, 'Student permit', 0.00),
+ ('10000000-0000-4000-8000-000000000002', 'Demo Campus South Lot', 39.726900, -121.8488000, 'Student permit', 0.00),
+ ('10000000-0000-4000-8000-000000000003', 'Demo Downtown Garage', 39.728300, -121.8409000, 'Hourly parking', 2.00),
+ ('10000000-0000-4000-8000-000000000004', 'Demo West Campus Lot', 39.729500, -121.8532000, 'General permit', 0.00)
+on conflict (parking_location_id) do nothing;
+
+
+-- Fixed IDs prevent duplicate reports when rerunning the script.
+-- Relative timestamps keep reports recent for testing.
+insert into public.parking_reports
+ (parking_report_id, student_id, parking_location_id, reported_condition, submitted_at, verification_status)
+values
+ ('20000000-0000-4000-8000-000000000001', '66cf2911-55ae-4e82-a0b4-473ecb83aeff', '10000000-0000-4000-8000-000000000001', 'Open', now() - interval '15 minutes', 'Pending'),
+ ('20000000-0000-4000-8000-000000000002', '63755afd-9d50-4c5f-9a84-0cf8d1d59431', '10000000-0000-4000-8000-000000000002', 'Nearly Full', now() - interval '25 minutes', 'Pending'),
+ ('20000000-0000-4000-8000-000000000003', '66cf2911-55ae-4e82-a0b4-473ecb83aeff', '10000000-0000-4000-8000-000000000003', 'Full', now() - interval '40 minutes', 'Pending'),
+ ('20000000-0000-4000-8000-000000000004', '63755afd-9d50-4c5f-9a84-0cf8d1d59431', '10000000-0000-4000-8000-000000000004', 'Open', now() - interval '10 minutes', 'Pending'),
+ ('20000000-0000-4000-8000-000000000005', '66cf2911-55ae-4e82-a0b4-473ecb83aeff', '10000000-0000-4000-8000-000000000002', 'Full', now() - interval '5 minutes', 'Pending')
+on conflict (parking_report_id) do nothing;
+
+
+-- One recent route per student, as required by the unique(student_id) constraint.
+insert into public.recent_routes
+ (recent_route_id, student_id, parking_location_id, route_started_at)
+values
+ ('30000000-0000-4000-8000-000000000001', '66cf2911-55ae-4e82-a0b4-473ecb83aeff', '10000000-0000-4000-8000-000000000001', now() - interval '1 hour'),
+ ('30000000-0000-4000-8000-000000000002', '63755afd-9d50-4c5f-9a84-0cf8d1d59431', '10000000-0000-4000-8000-000000000004', now() - interval '2 hours')
+on conflict (student_id) do nothing;
+
+
+commit;
+
+
